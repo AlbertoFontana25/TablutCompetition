@@ -13,6 +13,7 @@ import java.util.logging.*;
 
 import it.unibo.ai.didattica.competition.tablut.domain.*;
 import it.unibo.ai.didattica.competition.tablut.domain.State.Turn;
+import it.unibo.ai.didattica.competition.tablut.domain.StateWrapper.Result;
 import it.unibo.ai.didattica.competition.tablut.gui.Gui;
 import it.unibo.ai.didattica.competition.tablut.util.Configuration;
 import it.unibo.ai.didattica.competition.tablut.util.StreamUtils;
@@ -73,6 +74,11 @@ public class Server implements Runnable {
 
 	private Socket white;
 	private Socket black;
+	
+	/**
+	 * Socket to connect to tablut board
+	 */
+	private Socket webAppSocket;
 
 	/**
 	 * Counter for the errors of the black player
@@ -92,8 +98,13 @@ public class Server implements Runnable {
 	 * Integer that represents the game type
 	 */
 	private int gameC;
+	
+	/**
+	 * Flag for connection to tablut board
+	 */
+	boolean webAppConnected = false;
 
-	public Server(int timeout, int cacheSize, int numErrors, int repeated, int game, boolean gui) {
+	public Server(int timeout, int cacheSize, int numErrors, int repeated, int game, boolean gui, boolean webAppConnected) {
 		this.gameC = game;
 		this.enableGui = gui;
 		this.time = timeout;
@@ -101,6 +112,7 @@ public class Server implements Runnable {
 		this.errors = numErrors;
 		this.cacheSize = cacheSize;
 		this.gson = new Gson();
+		this.webAppConnected = webAppConnected;
 	}
 
 	public void initializeGUI(State state) {
@@ -124,6 +136,7 @@ public class Server implements Runnable {
 		int errors = 0;
 		int gameChosen = 4;
 		boolean enableGui = true;
+		boolean webAppConnected = false;
 
 		CommandLineParser parser = new DefaultParser();
 
@@ -135,6 +148,7 @@ public class Server implements Runnable {
 		options.addOption("s", "repeatedState", true, "repeatedStates must be an integer >= 0; default: 0");
 		options.addOption("r","game rules", true, "game rules must be an integer; 1 for Tablut, 2 for Modern, 3 for Brandub, 4 for Ashton; default: 4");
 		options.addOption("g","enableGUI", false, "enableGUI if option is present");
+		options.addOption("w","web-app", false, "enable web socket that send data to the web application");
 
 		HelpFormatter formatter = new HelpFormatter();
 		formatter.printHelp("java Server", options);
@@ -210,13 +224,15 @@ public class Server implements Runnable {
 			}else{
 				enableGui=false;
 			}
+			
+			webAppConnected = cmd.hasOption("w");
 
 		}catch (ParseException exp){
 			System.out.println( "Unexpected exception:" + exp.getMessage() );
 		}
 
 		// Start the server
-		Server engine = new Server(time, moveCache, errors, repeated, gameChosen, enableGui);
+		Server engine = new Server(time, moveCache, errors, repeated, gameChosen, enableGui, webAppConnected);
 		engine.run();
 	}
 
@@ -345,6 +361,17 @@ public class Server implements Runnable {
 		 * Channel to send the state to the black player
 		 */
 		DataOutputStream blackState = null;
+		
+		/**
+		 * Channel to send the state to tablut board
+		 */
+		DataOutputStream webAppState = null;
+		
+		/**
+		 * StateWrapper to send to tablut board
+		 */
+		StateWrapper stateWrapper = null;
+		
 		System.out.println("Waiting for connections...");
 
 		String whiteName = "WP";
@@ -363,7 +390,19 @@ public class Server implements Runnable {
 			this.socketWhite = new ServerSocket(Configuration.whitePort);
 			this.socketBlack = new ServerSocket(Configuration.blackPort);
 			
-
+			if(webAppConnected) {
+				try {
+					this.webAppSocket = new Socket(Configuration.tablutBoardHost, Configuration.tablutBoardPort);
+					webAppState = new DataOutputStream(webAppSocket.getOutputStream());
+					loggSys.info("Successful connection to tablut board application");
+					webAppConnected = true;
+				} catch (Exception e) {
+					loggSys.warning("Cannot connect to tablut board socket");
+					e.printStackTrace();
+					webAppConnected = false;
+				}
+			}
+			
 			// ESTABLISHING CONNECTION
 			tc = new TCPConnection(socketWhite);
 			t = new Thread(tc);
@@ -524,6 +563,12 @@ public class Server implements Runnable {
 			theGson = gson.toJson(state);
 			StreamUtils.writeString(whiteState, theGson);
 			StreamUtils.writeString(blackState, theGson);
+			
+			if(webAppConnected) {
+				stateWrapper = initStateWrapper(whiteName, blackName, state);
+				webAppConnected = tryWriteString(webAppState, stateWrapper, loggSys);
+			}
+			
 			loggSys.fine("Invio messaggio ai giocatori");
 			if (enableGui) {
 				theGui.update(state);
@@ -562,6 +607,13 @@ public class Server implements Runnable {
 				System.out.println("Player " + state.getTurn().toString() + " has lost!");
 				loggSys.warning("Timeout! Player " + state.getTurn() + " lose!");
 				loggSys.warning("Chiusura sistema per timeout");
+				
+				if(webAppConnected) {
+					stateWrapper.setResult(state.getTurn().equals(Turn.BLACK) ? Result.BLACKTIMEOUT : Result.WHITETIMEOUT);
+					stateWrapper.setLastAction(null);
+					webAppConnected = tryWriteString(webAppState, stateWrapper, loggSys);
+				}
+				
 				System.exit(0);
 			}
 
@@ -570,11 +622,21 @@ public class Server implements Runnable {
 			move = this.gson.fromJson(theGson, Action.class);
 			loggSys.fine("Move received.\t" + move.toString());
 			move.setTurn(state.getTurn());
+			
+			if(webAppConnected) {
+				stateWrapper.setLastAction(move);
+			}
+			
 			System.out.println("Suggested move: " + move.toString());
 
 			try {
 				// aggiorna tutto e determina anche eventuali fine partita
 				state = this.game.checkMove(state, move);
+				
+				if(webAppConnected) {
+					stateWrapper.setResult(Result.PLAYING);
+					stateWrapper.setState(state);
+				}
 			} catch (Exception e) {
 				// exception means error, therefore increase the error counters
 				if (state.getTurn().equalsTurn("B")) {
@@ -584,6 +646,12 @@ public class Server implements Runnable {
 						System.out.println("TOO MANY ERRORS FOR BLACK PLAYER; PLAYER WHITE WIN!");
 						e.printStackTrace();
 						loggSys.warning("Chiusura sistema per troppi errori giocatore nero");
+						
+						if(webAppConnected) {
+							stateWrapper.setResult(Result.BLACKERROR);
+							webAppConnected = tryWriteString(webAppState, stateWrapper, loggSys);
+						}
+						
 						System.exit(1);
 					} else {
 						System.out.println("Error for black player...");
@@ -595,6 +663,12 @@ public class Server implements Runnable {
 						System.out.println("TOO MANY ERRORS FOR WHITE PLAYER; PLAYER BLACK WIN!");
 						e.printStackTrace();
 						loggSys.warning("Chiusura sistema per troppi errori giocatore bianco");
+						
+						if(webAppConnected) {
+							stateWrapper.setResult(Result.WHITEERROR);
+							webAppConnected = tryWriteString(webAppState, stateWrapper, loggSys);
+						}
+						
 						System.exit(1);
 					} else {
 						System.out.println("Error for white player...");
@@ -621,6 +695,7 @@ public class Server implements Runnable {
 				theGson = gson.toJson(state);
 				StreamUtils.writeString(whiteState, theGson);
 				StreamUtils.writeString(blackState, theGson);
+				
 				loggSys.fine("Invio messaggio ai client");
 				if (enableGui) {
 					theGui.update(state);
@@ -629,43 +704,97 @@ public class Server implements Runnable {
 				e.printStackTrace();
 				loggSys.warning("Errore invio messaggio ai client");
 				loggSys.warning("Chiusura sistema");
+				
+				if(webAppConnected) {
+					stateWrapper.setResult(Result.ERROR);
+					stateWrapper.setLastAction(null);
+					webAppConnected = tryWriteString(webAppState, stateWrapper, loggSys);
+				}
+				
 				System.exit(1);
 			}
 
 
 			switch (state.getTurn()) {
 			case WHITE:
+				if(webAppConnected) {
+					webAppConnected = tryWriteString(webAppState, stateWrapper, loggSys);
+				}
 				tin = Turnwhite;
 				break;
 			case BLACK:
+				if(webAppConnected) {
+					webAppConnected = tryWriteString(webAppState, stateWrapper, loggSys);
+				}
 				tin = Turnblack;
 				break;
 			case BLACKWIN:
 				this.game.endGame(state);
 				System.out.println("END OF THE GAME");
 				System.out.println("RESULT: PLAYER BLACK WIN");
+				if(webAppConnected) {
+					stateWrapper.setResult(Result.BLACKWIN);
+					webAppConnected = tryWriteString(webAppState, stateWrapper, loggSys);
+				}
 				endgame = true;
 				break;
 			case WHITEWIN:
 				this.game.endGame(state);
 				System.out.println("END OF THE GAME");
 				System.out.println("RESULT: PLAYER WHITE WIN");
+				if(webAppConnected) {
+					stateWrapper.setResult(Result.WHITEWIN);
+					webAppConnected = tryWriteString(webAppState, stateWrapper, loggSys);
+				}
 				endgame = true;
 				break;
 			case DRAW:
 				this.game.endGame(state);
 				System.out.println("END OF THE GAME");
 				System.out.println("RESULT: DRAW");
+				if(webAppConnected) {
+					stateWrapper.setResult(Result.DRAW);
+					webAppConnected = tryWriteString(webAppState, stateWrapper, loggSys);
+				}
 				endgame = true;
 				break;
 			default:
 				loggSys.warning("Chiusura sistema");
+				if(webAppConnected) {
+					stateWrapper.setResult(Result.ERROR);
+					stateWrapper.setLastAction(null);
+					webAppConnected = tryWriteString(webAppState, stateWrapper, loggSys);
+				}
 				System.exit(4);
 			}
 
 		}
-		
 		System.exit(0);
+	}
+	
+	private StateWrapper initStateWrapper(String whitePlayerName, String blackPlayerName, State state) {
+		StateWrapper stateWrapper = new StateWrapper();
+		
+		stateWrapper.setWhitePlayerName(whitePlayerName);
+		stateWrapper.setBlackPlayerName(blackPlayerName);
+		stateWrapper.setState(state);
+		stateWrapper.setResult(Result.START);
+		
+		return stateWrapper;
+	}
+	
+	private boolean tryWriteString(DataOutputStream webAppState, StateWrapper stateWrapper, Logger loggSys) {
+		try {
+			StreamUtils.writeString(webAppState, gson.toJson(stateWrapper));
+			loggSys.fine("State wrapper send to tablut board");
+			
+			return true;
+		} catch(Exception e) {
+			loggSys.warning("Error on sending state wrapper to tablut board");
+			e.printStackTrace();
+			
+			return false;
+		}
 	}
 
 }

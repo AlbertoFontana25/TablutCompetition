@@ -1,0 +1,35 @@
+version: '3'
+
+services:
+    # Server
+    server:
+        image: albertofontana/tablut-server
+        expose:
+            - '5800'
+            - '5801'
+        networks:
+            tablut:
+
+    # White
+    white:
+        image: albertofontana/random-white
+        expose:
+            - '5800'
+        depends_on:
+            - server
+        networks:
+            tablut:
+
+    # Black
+    black:
+        image: albertofontana/random-black
+        expose:
+            - '5801'
+        depends_on:
+            - server
+            - white
+        networks:
+            tablut:
+
+networks:
+    tablut:

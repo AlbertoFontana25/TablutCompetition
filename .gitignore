@@ -7,6 +7,9 @@
 *.obj
 *.elf
 
+# Compiled class
+*.class
+
 # Linker output
 *.ilk
 *.map
@@ -53,3 +56,22 @@ dkms.conf
 
 #IDE metadata
 **.idea/**
+.idea
+*.iws
+*.iml
+*.ipr
+
+### STS ###
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+
+### VS Code ###
+.vscode/
+/database/
+/bin/
+bin/
